@@ -1,8 +1,14 @@
 <?php
 session_start();
 
-// 🔐 БЕЗПЕКА: Змініть цей пароль!
-$admin_pass = password_hash('ваш_сильний_пароль_тут', PASSWORD_DEFAULT);
+// БЕЗПЕКА: Пароль зберігається в окремому файлі
+$admin_pass_file = __DIR__ . '/.admin_pass';
+if (!file_exists($admin_pass_file)) {
+    // Дефолтний пароль: admin (ЗМІНІТЬ!)
+    file_put_contents($admin_pass_file, password_hash('admin', PASSWORD_DEFAULT));
+}
+$admin_pass = trim(file_get_contents($admin_pass_file));
+
 define('IS_ADMIN', isset($_SESSION['admin']));
 
 // CSRF токен
@@ -59,97 +65,204 @@ try {
         FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE CASCADE
     )");
     
+    $db->exec("CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )");
+    
+    // Дефолтні налаштування
+    $defaults = [
+        'site_name' => 'Мій Блог',
+        'site_description' => 'Особистий блог',
+        'logo_path' => '',
+        'favicon_path' => '',
+        'accent_color' => '#0066cc',
+        'google_analytics' => ''
+    ];
+    
+    foreach ($defaults as $key => $value) {
+        $check = $db->query("SELECT value FROM settings WHERE key = " . $db->quote($key))->fetch();
+        if (!$check) {
+            $db->exec("INSERT INTO settings (key, value) VALUES (" . $db->quote($key) . ", " . $db->quote($value) . ")");
+        }
+    }
+    
 } catch (PDOException $e) {
     die("DB Error: " . htmlspecialchars($e->getMessage()));
 }
 
-// 🎨 ПОКРАЩЕНА ТИПОГРАФІКА
+/**
+ * MARKDOWN PARSER
+ * Перетворює Markdown в HTML
+ */
 function smart_typography($text) {
-    // Базові правила
-    $rules = [
-        // Лапки
-        '/(^|\s|>)"([^"]+)"/' => '$1«$2»',
-        '/«([^»]+)«([^»]+)»([^»]+)»/' => '«$1„$2"$3»', // Вкладені лапки
-        
-        // Тире та дефіси
-        '/ -- /' => ' — ',
-        '/(\d+)-(\d+)/' => '$1–$2', // Цифрове тире (діапазон)
-        '/(\s)—(\s)/' => '$1—$2', // Довге тире з пробілами
-        
-        // Спецсимволи
-        '/\(c\)/i' => '©',
-        '/\(r\)/i' => '®',
-        '/\(tm\)/i' => '™',
-        '/\.{3}/' => '…',
-        
-        // Пробіли
-        '/\s+/' => ' ', // Подвійні пробіли
-        '/(\d)\s+(грн|₴|USD|EUR|км|м|см|кг|г)/' => '$1 $2', // Нерозривний пробіл
-    ];
+    if (empty($text)) {
+        return '';
+    }
     
-    $text = preg_replace(array_keys($rules), array_values($rules), $text);
+    // Зберігаємо оригінальний текст для обробки
+    $text = trim($text);
     
-    // Обробка параграфів та галерей
+    // 1. БЛОКИ КОДУ (``` код ```)
+    $text = preg_replace_callback('/```(\w+)?\n(.*?)\n```/s', function($matches) {
+        $lang = $matches[1] ?? '';
+        $code = htmlspecialchars($matches[2], ENT_NOQUOTES);
+        return "\n<pre><code class=\"language-" . htmlspecialchars($lang) . "\">" . $code . "</code></pre>\n";
+    }, $text);
+    
+    // 2. INLINE КОД (`код`)
+    $text = preg_replace_callback('/`([^`]+)`/', function($matches) {
+        return '<code>' . htmlspecialchars($matches[1]) . '</code>';
+    }, $text);
+    
+    // 3. ЗОБРАЖЕННЯ ДЛЯ ГАЛЕРЕЇ (окремі рядки з /uploads/)
     $lines = explode("\n", $text);
-    $res = [];
-    $gal = [];
-    $code_block = false;
+    $processed_lines = [];
+    $gallery_images = [];
     
-    foreach ($lines as $l) {
-        $l = trim($l);
+    foreach ($lines as $line) {
+        $trimmed = trim($line);
         
-        // Блоки коду
-        if (preg_match('/^```(\w+)?/', $l, $m)) {
-            if (!empty($gal)) {
-                $res[] = render_fotorama($gal);
-                $gal = [];
+        // Пропускаємо вже оброблені HTML теги
+        if (preg_match('/^<(pre|code)/', $trimmed)) {
+            if (!empty($gallery_images)) {
+                $processed_lines[] = render_fotorama($gallery_images);
+                $gallery_images = [];
             }
-            if (!$code_block) {
-                $lang = $m[1] ?? '';
-                $res[] = '<pre><code class="language-' . htmlspecialchars($lang) . '">';
-                $code_block = true;
-            } else {
-                $res[] = '</code></pre>';
-                $code_block = false;
-            }
-            continue;
-        }
-        
-        if ($code_block) {
-            $res[] = htmlspecialchars($l);
+            $processed_lines[] = $line;
             continue;
         }
         
         // Зображення для галереї
-        if (preg_match('/^\/uploads\/.*\.(jpg|jpeg|png|gif|webp)$/i', $l)) {
-            $gal[] = $l;
+        if (preg_match('/^\/uploads\/.*\.(jpg|jpeg|png|gif|webp)$/i', $trimmed)) {
+            $gallery_images[] = $trimmed;
         } else {
-            if (!empty($gal)) {
-                $res[] = render_fotorama($gal);
-                $gal = [];
+            // Виводимо накопичену галерею
+            if (!empty($gallery_images)) {
+                $processed_lines[] = render_fotorama($gallery_images);
+                $gallery_images = [];
             }
-            if ($l !== '') {
-                $res[] = '<p>' . $l . '</p>';
-            }
+            $processed_lines[] = $line;
         }
     }
     
-    if (!empty($gal)) {
-        $res[] = render_fotorama($gal);
+    // Остання галерея
+    if (!empty($gallery_images)) {
+        $processed_lines[] = render_fotorama($gallery_images);
     }
     
-    return implode("\n", $res);
-}
-
-function render_fotorama($imgs) {
-    $h = '<div class="fotorama" data-nav="thumbs" data-width="100%" data-ratio="16/9" data-allowfullscreen="true">';
-    foreach ($imgs as $i) {
-        $h .= '<img src="' . htmlspecialchars($i) . '">';
+    $text = implode("\n", $processed_lines);
+    
+    // 4. ЗАГОЛОВКИ (# ## ###)
+    $text = preg_replace('/^### (.+)$/m', '<h3>$1</h3>', $text);
+    $text = preg_replace('/^## (.+)$/m', '<h2>$1</h2>', $text);
+    $text = preg_replace('/^# (.+)$/m', '<h1>$1</h1>', $text);
+    
+    // 5. ГОРИЗОНТАЛЬНА ЛІНІЯ (---)
+    $text = preg_replace('/^---$/m', '<hr>', $text);
+    
+    // 6. ЦИТАТИ (> текст)
+    $text = preg_replace_callback('/((?:^> .+$\n?)+)/m', function($matches) {
+        $lines = explode("\n", trim($matches[1]));
+        $content = '';
+        foreach ($lines as $line) {
+            $content .= preg_replace('/^> (.+)$/', '$1<br>', $line);
+        }
+        return '<blockquote>' . rtrim($content, '<br>') . '</blockquote>';
+    }, $text);
+    
+    // 7. СПИСКИ (МАРКОВАНИЙ: - * +)
+    $text = preg_replace_callback('/((?:^[\*\-\+] .+$\n?)+)/m', function($matches) {
+        $items = preg_replace('/^[\*\-\+] (.+)$/m', '<li>$1</li>', trim($matches[1]));
+        return '<ul>' . $items . '</ul>';
+    }, $text);
+    
+    // 8. СПИСКИ (НУМЕРОВАНИЙ: 1. 2. 3.)
+    $text = preg_replace_callback('/((?:^\d+\. .+$\n?)+)/m', function($matches) {
+        $items = preg_replace('/^\d+\. (.+)$/m', '<li>$1</li>', trim($matches[1]));
+        return '<ol>' . $items . '</ol>';
+    }, $text);
+    
+    // 9. ЗОБРАЖЕННЯ ![alt](url)
+    $text = preg_replace('/!\[([^\]]*)\]\(([^\)]+)\)/', '<img src="$2" alt="$1">', $text);
+    
+    // 10. ПОСИЛАННЯ [текст](url)
+    $text = preg_replace('/\[([^\]]+)\]\(([^\)]+)\)/', '<a href="$2">$1</a>', $text);
+    
+    // 11. ЖИРНИЙ ТЕКСТ (**текст** або __текст__)
+    $text = preg_replace('/\*\*(.+?)\*\*/', '<strong>$1</strong>', $text);
+    $text = preg_replace('/__(.+?)__/', '<strong>$1</strong>', $text);
+    
+    // 12. КУРСИВ (*текст* або _текст_)
+    // Але не чіпаємо * в списках та __ в посиланнях
+    $text = preg_replace('/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/', '<em>$1</em>', $text);
+    $text = preg_replace('/(?<!_)_(?!_)(.+?)(?<!_)_(?!_)/', '<em>$1</em>', $text);
+    
+    // 13. ПАРАГРАФИ (подвійний enter = новий параграф)
+    $lines = explode("\n", $text);
+    $output = '';
+    $paragraph = '';
+    
+    foreach ($lines as $line) {
+        $trimmed = trim($line);
+        
+        // Порожній рядок = кінець параграфу
+        if ($trimmed === '') {
+            if ($paragraph !== '') {
+                // Перевіряємо чи це не HTML тег
+                if (!preg_match('/^<(h[1-6]|ul|ol|blockquote|pre|hr|img|div)/', trim($paragraph))) {
+                    $output .= '<p>' . trim($paragraph) . '</p>' . "\n";
+                } else {
+                    $output .= trim($paragraph) . "\n";
+                }
+                $paragraph = '';
+            }
+            continue;
+        }
+        
+        // HTML теги виводимо відразу
+        if (preg_match('/^<(h[1-6]|ul|ol|blockquote|pre|hr|img|div)/', $trimmed)) {
+            if ($paragraph !== '') {
+                if (!preg_match('/^<(h[1-6]|ul|ol|blockquote|pre|hr|img|div)/', trim($paragraph))) {
+                    $output .= '<p>' . trim($paragraph) . '</p>' . "\n";
+                } else {
+                    $output .= trim($paragraph) . "\n";
+                }
+                $paragraph = '';
+            }
+            $output .= $line . "\n";
+        } else {
+            // Додаємо до параграфу
+            $paragraph .= ($paragraph !== '' ? ' ' : '') . $trimmed;
+        }
     }
-    return $h . '</div>';
+    
+    // Останній параграф
+    if ($paragraph !== '') {
+        if (!preg_match('/^<(h[1-6]|ul|ol|blockquote|pre|hr|img|div)/', trim($paragraph))) {
+            $output .= '<p>' . trim($paragraph) . '</p>';
+        } else {
+            $output .= trim($paragraph);
+        }
+    }
+    
+    return $output;
 }
 
-// Функції для тегів
+/**
+ * Рендер Fotorama галереї
+ */
+function render_fotorama($imgs) {
+    $html = '<div class="fotorama" data-nav="thumbs" data-width="100%" data-ratio="16/9" data-allowfullscreen="true">';
+    foreach ($imgs as $img) {
+        $html .= '<img src="' . htmlspecialchars($img) . '" alt="">';
+    }
+    return $html . '</div>';
+}
+
+/**
+ * ФУНКЦІЇ ДЛЯ ТЕГІВ
+ */
 function get_all_tags() {
     global $db;
     return $db->query("SELECT * FROM tags ORDER BY name")->fetchAll(PDO::FETCH_ASSOC);
@@ -199,26 +312,30 @@ function save_post_tags($post_id, $tag_names) {
     }
 }
 
-// Генерація RSS
+/**
+ * ГЕНЕРАЦІЯ RSS
+ */
 function generate_rss() {
     global $db;
+    $site_name = get_setting('site_name', 'Мій Блог');
+    $site_description = get_setting('site_description', 'Особистий блог');
     $posts = $db->query("SELECT * FROM notes WHERE is_draft = 0 ORDER BY stamp DESC LIMIT 20")->fetchAll(PDO::FETCH_ASSOC);
     
     $rss = '<?xml version="1.0" encoding="UTF-8"?>' . "\n";
     $rss .= '<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">' . "\n";
     $rss .= '<channel>' . "\n";
-    $rss .= '<title>Мій Блог</title>' . "\n";
-    $rss .= '<link>http://' . $_SERVER['HTTP_HOST'] . '/</link>' . "\n";
-    $rss .= '<description>Особистий блог</description>' . "\n";
+    $rss .= '<title>' . htmlspecialchars($site_name) . '</title>' . "\n";
+    $rss .= '<link>https://' . $_SERVER['HTTP_HOST'] . '/</link>' . "\n";
+    $rss .= '<description>' . htmlspecialchars($site_description) . '</description>' . "\n";
     $rss .= '<language>uk</language>' . "\n";
     
     foreach ($posts as $p) {
         $rss .= '<item>' . "\n";
         $rss .= '<title>' . htmlspecialchars($p['title']) . '</title>' . "\n";
-        $rss .= '<link>http://' . $_SERVER['HTTP_HOST'] . '/' . htmlspecialchars($p['url_name']) . '</link>' . "\n";
+        $rss .= '<link>https://' . $_SERVER['HTTP_HOST'] . '/' . htmlspecialchars($p['url_name']) . '</link>' . "\n";
         $rss .= '<description>' . htmlspecialchars($p['snippet'] ?? substr(strip_tags($p['text']), 0, 200)) . '</description>' . "\n";
         $rss .= '<pubDate>' . date('r', $p['stamp']) . '</pubDate>' . "\n";
-        $rss .= '<guid>http://' . $_SERVER['HTTP_HOST'] . '/' . htmlspecialchars($p['url_name']) . '</guid>' . "\n";
+        $rss .= '<guid>https://' . $_SERVER['HTTP_HOST'] . '/' . htmlspecialchars($p['url_name']) . '</guid>' . "\n";
         $rss .= '</item>' . "\n";
     }
     
@@ -228,8 +345,43 @@ function generate_rss() {
     return $rss;
 }
 
-// Escape функції для безпеки
+/**
+ * ESCAPE ФУНКЦІЯ ДЛЯ БЕЗПЕКИ
+ */
 function e($str) {
     return htmlspecialchars($str ?? '', ENT_QUOTES, 'UTF-8');
+}
+
+/**
+ * ФУНКЦІЇ НАЛАШТУВАНЬ
+ */
+function get_setting($key, $default = '') {
+    global $db;
+    $st = $db->prepare("SELECT value FROM settings WHERE key = ?");
+    $st->execute([$key]);
+    $result = $st->fetch(PDO::FETCH_ASSOC);
+    return $result ? $result['value'] : $default;
+}
+
+function set_setting($key, $value) {
+    global $db;
+    $check = $db->prepare("SELECT value FROM settings WHERE key = ?");
+    $check->execute([$key]);
+    
+    if ($check->fetch()) {
+        $db->prepare("UPDATE settings SET value = ? WHERE key = ?")->execute([$value, $key]);
+    } else {
+        $db->prepare("INSERT INTO settings (key, value) VALUES (?, ?)")->execute([$key, $value]);
+    }
+}
+
+function get_all_settings() {
+    global $db;
+    $settings = [];
+    $result = $db->query("SELECT key, value FROM settings")->fetchAll(PDO::FETCH_ASSOC);
+    foreach ($result as $row) {
+        $settings[$row['key']] = $row['value'];
+    }
+    return $settings;
 }
 ?>

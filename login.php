@@ -88,7 +88,7 @@ if (isset($_POST['p'])) {
 </head>
 <body>
     <div class="login-box">
-        <h1>🔐 Вхід до блогу</h1>
+        <h1> Вхід до блогу</h1>
         <?php if (isset($error)): ?>
             <div class="error"><?= htmlspecialchars($error) ?></div>
         <?php endif; ?>
